@@ -1,0 +1,3 @@
+requests>=2.31.0
+numpy>=1.26.0
+# torch is already a ComfyUI dependency – no need to re-install
