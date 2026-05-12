@@ -361,12 +361,20 @@ class LTXVRemoteCLIPConnection:
         resp.raise_for_status()
         data = resp.json()
 
-        # ── Decode all-hidden tensor [1, L, T, D] (float16) ─────────────────
+        # ── Decode all-hidden tensor [1, L, T, D] ───────────────────────────
+        # Server sends bfloat16 bytes viewed as int16 (numpy has no bf16 dtype).
+        # Reverse: read as int16, reinterpret as bfloat16 via torch view, cast to float32.
         shape = data["all_hidden_shape"]
         raw = base64.b64decode(data["all_hidden_b64"])
-        all_hidden = torch.from_numpy(
-            np.frombuffer(raw, dtype=np.float16).reshape(shape).copy()
-        ).float()  # [B, L, T, D]
+        wire_dtype = data.get("dtype", "float16")
+        if wire_dtype == "bfloat16":
+            all_hidden = torch.from_numpy(
+                np.frombuffer(raw, dtype=np.int16).reshape(shape).copy()
+            ).view(torch.bfloat16).float()  # [B, L, T, D]
+        else:
+            all_hidden = torch.from_numpy(
+                np.frombuffer(raw, dtype=np.float16).reshape(shape).copy()
+            ).float()  # [B, L, T, D] – legacy float16 path
 
         # ── Decode pooled [D] ────────────────────────────────────────────────
         p_raw = base64.b64decode(data["pooled_b64"])

@@ -470,10 +470,10 @@ async def comfy_encode_gemma_raw(req: GemmaRawEncodeRequest, _: None = AUTH):
         logger.exception("Gemma raw encode failed for model %s", req.model_name)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    all_hidden: np.ndarray = result["all_hidden"]   # [1, L, T, D] float16
+    all_hidden: np.ndarray = result["all_hidden"]   # [1, L, T, D] as int16 view of bfloat16
     pooled: np.ndarray = result["pooled"]           # [1, D] float32
 
-    # Encode float16 directly to base64 (no float32 upcast – saves 50% bandwidth)
+    # Raw bytes are a bfloat16 tensor viewed as int16; client reverses with view(bfloat16)
     all_hidden_b64 = base64.b64encode(
         np.ascontiguousarray(all_hidden).tobytes()
     ).decode("ascii")
@@ -483,7 +483,7 @@ async def comfy_encode_gemma_raw(req: GemmaRawEncodeRequest, _: None = AUTH):
         "all_hidden_shape": list(all_hidden.shape),
         "pooled_b64": _arr_to_b64(pooled[0]),   # [D]
         "pooled_shape": list(pooled.shape[1:]),
-        "dtype": "float16",
+        "dtype": "bfloat16",
     }
 
 

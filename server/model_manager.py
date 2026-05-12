@@ -819,8 +819,12 @@ class ModelManager:
         ]                                                        # [B, D]
 
         return {
-            # Store as float16 to halve transfer bandwidth; client casts back to float32
-            "all_hidden": trimmed.to(torch.float16).cpu().numpy(),
+            # bfloat16 shares float32's exponent range so FP8 activations can't
+            # overflow on the wire (float16 maxes at ~65504 and produces Inf/NaN
+            # in the projection's x**2 norm step).
+            # numpy has no bf16 dtype – send raw bytes via an int16 view instead;
+            # the client reverses this with tensor.view(torch.bfloat16).
+            "all_hidden": trimmed.to(torch.bfloat16).view(torch.int16).cpu().numpy(),
             "pooled": pooled.to(torch.float32).cpu().numpy(),
         }
 
