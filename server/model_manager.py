@@ -210,20 +210,32 @@ def _config_source(model_id: str, family: str, cache_dir: Optional[str]) -> str:
 
 def _safetensors_stored_dtype(path: str) -> Optional[torch.dtype]:
     """
-    Return the torch dtype that the first tensor in the safetensors file is
-    stored in, or None if it cannot be determined.  Used to detect pre-quantised
-    FP8 files so we avoid an fp8 → bf16 → fp8 roundtrip.
+    Return the dominant weight dtype stored in the safetensors file.
+
+    Embedding and norm layers are often kept in bf16 even in mixed-precision
+    FP8 checkpoints.  We scan the first few *weight* tensors (which are the
+    heavy linear projections) to find the actual compute dtype.
     """
-    _st_dtype_map = {
-        "F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16,
-        "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
-        "I8": torch.int8, "I16": torch.int16, "I32": torch.int32,
-    }
+    _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
     try:
         with safe_open(path, framework="pt", device="cpu") as f:
-            key = next(iter(f.keys()))
-            dtype_str = f.get_tensor(key).dtype  # returns torch.dtype directly
-            return dtype_str  # already a torch.dtype from safetensors>=0.4
+            keys = list(f.keys())
+            # Prefer tensors whose keys look like projection weights
+            weight_keys = [k for k in keys if k.endswith(".weight")
+                           and not any(s in k for s in
+                                       ("embed_tokens", "layernorm", "norm",
+                                        "embed_positions", "bias"))]
+            # Fall back to all keys if no obvious weights found
+            scan_keys = (weight_keys or keys)[:20]
+            first_dtype = None
+            for k in scan_keys:
+                dt = f.get_tensor(k).dtype
+                if first_dtype is None:
+                    first_dtype = dt
+                if dt in _FP8_DTYPES:
+                    return dt          # found an FP8 tensor – report immediately
+            # No FP8 tensor found; return dtype of the first scanned key
+            return first_dtype
     except Exception:
         return None
 
@@ -484,6 +496,44 @@ class ModelManager:
             # Cast to target dtype in-place before assigning to avoid a second copy
             state_dict = {k: v.to(dtype=load_dtype) for k, v in state_dict.items()}
             missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
+
+            # ── Auto-remap key prefix if there's a total mismatch ─────────────
+            # Symptom: all keys are both "missing" and "unexpected" – the model
+            # and checkpoint use different top-level prefix conventions, e.g.:
+            #   File:  model.layers.*          (standalone text encoder)
+            #   Model: language_model.model.*  (Gemma3ForConditionalGeneration)
+            if len(missing) > 0 and len(missing) == len(unexpected):
+                model_keys  = set(model.state_dict().keys())
+                file_keys   = set(state_dict.keys())
+                # Find a prefix that, when prepended to file keys, lands in model keys.
+                # Try the most common remapping: bare model.* → language_model.model.*
+                candidate_prefixes = [
+                    ("model.",    "language_model.model."),
+                    ("model.",    "language_model."),
+                    ("",          "language_model."),
+                ]
+                for src_pfx, dst_pfx in candidate_prefixes:
+                    remapped = {
+                        (dst_pfx + k[len(src_pfx):])
+                        if k.startswith(src_pfx) else k: v
+                        for k, v in state_dict.items()
+                    }
+                    # Accept remap if at least 50% of remapped keys are in the model
+                    overlap = len(set(remapped) & model_keys)
+                    if overlap >= len(model_keys) * 0.5:
+                        logger.info(
+                            "Key prefix remapped: '%s' → '%s'  (%d/%d keys matched)",
+                            src_pfx, dst_pfx, overlap, len(model_keys),
+                        )
+                        missing, unexpected = model.load_state_dict(
+                            remapped, strict=False, assign=True
+                        )
+                        break
+                else:
+                    logger.warning(
+                        "100%% key mismatch and no automatic prefix remap worked. "
+                        "The checkpoint may use an unsupported key layout."
+                    )
             if missing:
                 logger.warning("%d missing keys in state dict (may be normal for tied weights)", len(missing))
             if unexpected:
