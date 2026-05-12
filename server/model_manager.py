@@ -511,8 +511,18 @@ class ModelManager:
 
             logger.info("Loading weights from %s directly to %s (%s)", model_id, self._device, load_dtype)
             state_dict = safetensors_load_file(model_id, device=str(self._device))
-            # Cast to target dtype in-place before assigning to avoid a second copy
-            state_dict = {k: v.to(dtype=load_dtype) for k, v in state_dict.items()}
+            # Cast to target dtype.  For FP8 loads, keep embedding/norm tensors
+            # in bfloat16 – FP8 arithmetic is not implemented for those ops.
+            _FP8_SKIP = ("embed", "norm", "ln_")
+            if _is_fp8(load_dtype):
+                state_dict = {
+                    k: (v.to(dtype=torch.bfloat16)
+                        if any(s in k.lower() for s in _FP8_SKIP)
+                        else v.to(dtype=load_dtype))
+                    for k, v in state_dict.items()
+                }
+            else:
+                state_dict = {k: v.to(dtype=load_dtype) for k, v in state_dict.items()}
             missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
 
             # ── Auto-remap key prefix if there's a total mismatch ─────────────
@@ -562,9 +572,11 @@ class ModelManager:
             # FP8 arithmetic is not implemented for embedding lookups
             # (Gemma3 multiplies hidden states by embed_scale in-place).  Keep
             # the embedding table in bfloat16 regardless of the load dtype.
-            if fp8:
+            # Note: use load_dtype here, not fp8 – the user may have requested
+            # fp16 but the checkpoint was already FP8 so load_dtype is fp8.
+            if _is_fp8(load_dtype):
                 emb = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
-                if emb is not None and emb.weight.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+                if emb is not None and _is_fp8(emb.weight.dtype):
                     emb.weight = torch.nn.Parameter(emb.weight.to(torch.bfloat16))
             # Resolve tied weights (e.g. lm_head ↔ shared) so no meta tensors remain
             if hasattr(model, "tie_weights"):
