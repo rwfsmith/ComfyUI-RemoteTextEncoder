@@ -518,9 +518,11 @@ class ModelManager:
                         if k.startswith(src_pfx) else k: v
                         for k, v in state_dict.items()
                     }
-                    # Accept remap if at least 50% of remapped keys are in the model
+                    # Accept remap if at least 50% of the *checkpoint* keys land in
+                    # the model.  Using model key count as denominator is wrong for
+                    # multimodal checkpoints (vision tower inflates the total).
                     overlap = len(set(remapped) & model_keys)
-                    if overlap >= len(model_keys) * 0.5:
+                    if overlap >= len(file_keys) * 0.5:
                         logger.info(
                             "Key prefix remapped: '%s' → '%s'  (%d/%d keys matched)",
                             src_pfx, dst_pfx, overlap, len(model_keys),
@@ -539,6 +541,13 @@ class ModelManager:
             if unexpected:
                 logger.warning("%d unexpected keys in state dict", len(unexpected))
             del state_dict
+            # FP8 arithmetic is not implemented for embedding lookups
+            # (Gemma3 multiplies hidden states by embed_scale in-place).  Keep
+            # the embedding table in bfloat16 regardless of the load dtype.
+            if fp8:
+                emb = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+                if emb is not None and emb.weight.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+                    emb.weight = torch.nn.Parameter(emb.weight.to(torch.bfloat16))
             # Resolve tied weights (e.g. lm_head ↔ shared) so no meta tensors remain
             if hasattr(model, "tie_weights"):
                 model.tie_weights()
