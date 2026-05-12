@@ -179,12 +179,7 @@ def _detect_family(model_id: str) -> str:
 _FAMILY_FALLBACK_REPO: dict[str, str] = {
     "clip":  "openai/clip-vit-large-patch14",
     "t5":    "google/t5-v1_1-xxl",
-    # Use the text-only (CausalLM) variant so AutoModelForCausalLM.from_config
-    # produces Gemma3ForCausalLM with model.layers.* keys, matching standalone
-    # text-encoder safetensors files.  The "-it" (instruction-tuned) variant is
-    # Gemma3ForConditionalGeneration and puts language weights under
-    # language_model.model.* which mismatches the checkpoint layout.
-    "gemma": "google/gemma-3-12b",
+    "gemma": "google/gemma-3-12b-it",
 }
 
 
@@ -490,8 +485,26 @@ class ModelManager:
                 )
                 if tokenizer.pad_token is None:
                     tokenizer.pad_token = tokenizer.eos_token
+                # Gemma3ForConditionalGeneration (multimodal) wraps the text
+                # encoder under language_model.model.*, but standalone
+                # safetensors checkpoints use model.layers.* (text-encoder
+                # layout matching Gemma3ForCausalLM).  Detect this and build
+                # only the CausalLM from text_config so keys align.
+                causal_cfg = arch_config
+                if (
+                    hasattr(arch_config, "text_config")
+                    and getattr(arch_config, "model_type", "") == "gemma3"
+                    and "ForConditionalGeneration" in (
+                        getattr(arch_config, "architectures", [""])[0]
+                    )
+                ):
+                    causal_cfg = arch_config.text_config
+                    logger.info(
+                        "Gemma3ForConditionalGeneration config detected; building "
+                        "Gemma3ForCausalLM from text_config for standalone safetensors."
+                    )
                 with init_empty_weights():
-                    model = AutoModelForCausalLM.from_config(arch_config)
+                    model = AutoModelForCausalLM.from_config(causal_cfg)
 
             else:
                 raise ValueError(f"Unsupported model family: {family!r}")
