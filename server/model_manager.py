@@ -179,7 +179,12 @@ def _detect_family(model_id: str) -> str:
 _FAMILY_FALLBACK_REPO: dict[str, str] = {
     "clip":  "openai/clip-vit-large-patch14",
     "t5":    "google/t5-v1_1-xxl",
-    "gemma": "google/gemma-3-12b-it",
+    # Use the text-only (CausalLM) variant so AutoModelForCausalLM.from_config
+    # produces Gemma3ForCausalLM with model.layers.* keys, matching standalone
+    # text-encoder safetensors files.  The "-it" (instruction-tuned) variant is
+    # Gemma3ForConditionalGeneration and puts language weights under
+    # language_model.model.* which mismatches the checkpoint layout.
+    "gemma": "google/gemma-3-12b",
 }
 
 
